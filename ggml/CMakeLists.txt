@@ -140,7 +140,7 @@ option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp on
 
 option(GGML_HIP                             "ggml: use HIP"                                   OFF)
 option(GGML_HIP_UMA                         "ggml: use HIP unified memory architecture"       OFF)
-option(GGML_VULKAN                          "ggml: use Vulkan"                                OFF)
+option(GGML_VULKAN                          "ggml: use Vulkan"                                ON)
 option(GGML_VULKAN_CHECK_RESULTS            "ggml: run Vulkan op checks"                      OFF)
 option(GGML_VULKAN_DEBUG                    "ggml: enable Vulkan debug output"                OFF)
 option(GGML_VULKAN_MEMORY_DEBUG             "ggml: enable Vulkan memory debug output"         OFF)
