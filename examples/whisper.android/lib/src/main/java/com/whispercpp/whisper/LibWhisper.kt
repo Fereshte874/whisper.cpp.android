@@ -3,10 +3,12 @@ package com.whispercpp.whisper
 import android.content.res.AssetManager
 import android.os.Build
 import android.util.Log
+import androidx.annotation.RequiresApi
 import kotlinx.coroutines.*
-import org.intellij.lang.annotations.Language
 import java.io.File
 import java.io.InputStream
+import java.util.concurrent.Callable
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 
 private const val LOG_TAG = "LibWhisper"
@@ -17,36 +19,59 @@ class WhisperContext private constructor(private var ptr: Long) {
         Executors.newSingleThreadExecutor().asCoroutineDispatcher()
     )
 
-    suspend fun transcribeData(data: FloatArray, language: String = "en", printTimestamp: Boolean = true): String = withContext(scope.coroutineContext) {
-        require(ptr != 0L)
-        val numThreads = WhisperCpuConfig.preferredThreadCount
-        Log.d(LOG_TAG, "Selecting $numThreads threads")
-        WhisperLib.fullTranscribe(ptr, numThreads, language, data)
-        val textCount = WhisperLib.getTextSegmentCount(ptr)
-        return@withContext buildString {
-            for (i in 0 until textCount) {
-                if (printTimestamp) {
-                    val textTimestamp = "[${toTimestamp(WhisperLib.getTextSegmentT0(ptr, i))} --> ${toTimestamp(WhisperLib.getTextSegmentT1(ptr, i))}]"
-                    val textSegment = WhisperLib.getTextSegment(ptr, i)
-                    append("$textTimestamp: $textSegment\n")
-                } else {
-                    append(WhisperLib.getTextSegment(ptr, i))
+    private val executorService = Executors.newSingleThreadExecutor()
+
+
+    @Throws(ExecutionException::class, InterruptedException::class)
+    fun transcribeData(
+        data: FloatArray,
+        language: String = "en",
+        printTimestamp: Boolean = true
+    ): String {
+        return executorService.submit<String>(object : Callable<String> {
+            @RequiresApi(api = Build.VERSION_CODES.O)
+            @Throws(java.lang.Exception::class)
+            override fun call(): String {
+                check(ptr != 0L)
+                val numThreads: Int = WhisperCpuConfig.preferredThreadCount
+                Log.d(LOG_TAG, "Selecting $numThreads threads")
+
+                val result = StringBuilder()
+                synchronized(this) {
+                    WhisperLib.fullTranscribe(ptr, numThreads, language, data)
+                    val textCount = WhisperLib.getTextSegmentCount(ptr)
+                    for (i in 0 until textCount) {
+                        val sentence = WhisperLib.getTextSegment(ptr, i)
+                        result.append(sentence)
+                    }
                 }
+                return result.toString()
             }
-        }
+        }).get()
     }
 
-    suspend fun streamTranscribeData(data: FloatArray, language: String = "en"): String = withContext(scope.coroutineContext) {
-        require(ptr != 0L)
-        val numThreads = WhisperCpuConfig.preferredThreadCount
-        Log.d(LOG_TAG, "Selecting $numThreads threads")
-        WhisperLib.fullStreamTranscribe(ptr, numThreads, language, data)
-        val textCount = WhisperLib.getTextSegmentCount(ptr)
-        return@withContext buildString {
-            for (i in 0 until textCount) {
-                append(WhisperLib.getTextSegment(ptr, i))
+    @Throws(ExecutionException::class, InterruptedException::class)
+    fun streamTranscribeData(data: FloatArray, language: String = "en"): String {
+        return executorService.submit<String>(object : Callable<String> {
+            @RequiresApi(api = Build.VERSION_CODES.O)
+            @Throws(java.lang.Exception::class)
+            override fun call(): String {
+                check(ptr != 0L)
+                val numThreads: Int = WhisperCpuConfig.preferredThreadCount
+                Log.d(LOG_TAG, "Selecting $numThreads threads")
+
+                val result = StringBuilder()
+                synchronized(this) {
+                    WhisperLib.fullStreamTranscribe(ptr, numThreads, language, data)
+                    val textCount = WhisperLib.getTextSegmentCount(ptr)
+                    for (i in 0 until textCount) {
+                        val sentence = WhisperLib.getTextSegment(ptr, i)
+                        result.append(sentence)
+                    }
+                }
+                return result.toString()
             }
-        }
+        }).get()
     }
 
     suspend fun benchMemory(nthreads: Int): String = withContext(scope.coroutineContext) {
@@ -148,8 +173,20 @@ private class WhisperLib {
         external fun initContextFromAsset(assetManager: AssetManager, assetPath: String): Long
         external fun initContext(modelPath: String): Long
         external fun freeContext(contextPtr: Long)
-        external fun fullTranscribe(contextPtr: Long, numThreads: Int, language: String, audioData: FloatArray)
-        external fun fullStreamTranscribe(contextPtr: Long, numThreads: Int, language: String, audioData: FloatArray)
+        external fun fullTranscribe(
+            contextPtr: Long,
+            numThreads: Int,
+            language: String,
+            audioData: FloatArray
+        )
+
+        external fun fullStreamTranscribe(
+            contextPtr: Long,
+            numThreads: Int,
+            language: String,
+            audioData: FloatArray
+        )
+
         external fun getTextSegmentCount(contextPtr: Long): Int
         external fun getTextSegment(contextPtr: Long, index: Int): String
         external fun getTextSegmentT0(contextPtr: Long, index: Int): Long
