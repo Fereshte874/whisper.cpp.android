@@ -15,12 +15,11 @@ private const val LOG_TAG = "LibWhisper"
 
 class WhisperContext private constructor(private var ptr: Long) {
     // Meet Whisper C++ constraint: Don't access from more than one thread at a time.
-    private val scope: CoroutineScope = CoroutineScope(
-        Executors.newSingleThreadExecutor().asCoroutineDispatcher()
-    )
+//    private val scope: CoroutineScope = CoroutineScope(
+//        Executors.newSingleThreadExecutor().asCoroutineDispatcher()
+//    )
 
     private val executorService = Executors.newSingleThreadExecutor()
-
 
     @Throws(ExecutionException::class, InterruptedException::class)
     fun transcribeData(
@@ -74,18 +73,15 @@ class WhisperContext private constructor(private var ptr: Long) {
         }).get()
     }
 
-    suspend fun benchMemory(nthreads: Int): String = withContext(scope.coroutineContext) {
-        return@withContext WhisperLib.benchMemcpy(nthreads)
-    }
-
-    suspend fun benchGgmlMulMat(nthreads: Int): String = withContext(scope.coroutineContext) {
-        return@withContext WhisperLib.benchGgmlMulMat(nthreads)
-    }
-
-    suspend fun release() = withContext(scope.coroutineContext) {
-        if (ptr != 0L) {
-            WhisperLib.freeContext(ptr)
-            ptr = 0
+    fun release() {
+        executorService?.let {
+            it.submit {
+                if (ptr != 0L) {
+                    WhisperLib.freeContext(ptr)
+                    ptr = 0
+                }
+            }
+            it.shutdownNow()
         }
     }
 
