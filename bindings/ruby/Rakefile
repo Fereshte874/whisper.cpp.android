@@ -18,24 +18,13 @@ EXTSOURCES.each do |src|
 end
 
 CLEAN.include SOURCES
-CLEAN.include FileList[
-                "ext/*.o",
-                "ext/*.metal",
-                "ext/whisper.{so,bundle,dll}",
-                "ext/depend"
-              ]
+CLEAN.include FileList["ext/*.o", "ext/*.metal", "ext/whisper.{so,bundle,dll}"]
 
-task build: FileList[
-       "ext/Makefile",
-       "ext/ruby_whisper.h",
-       "ext/ruby_whisper.cpp",
-       "whispercpp.gemspec",
-     ]
+task build: ["ext/Makefile", "ext/ruby_whisper.h", "ext/ruby_whisper.cpp", "whispercpp.gemspec"]
 
 directory "pkg"
 CLOBBER.include "pkg"
 
-TEST_MODEL = "../../models/ggml-base.en.bin"
 LIB_NAME = "whisper".ext(RbConfig::CONFIG["DLEXT"])
 SO_FILE = File.join("ext", LIB_NAME)
 LIB_FILE = File.join("lib", LIB_NAME)
@@ -51,20 +40,25 @@ file SO_FILE => "ext/Makefile" do |t|
     sh "make"
   end
 end
-CLEAN.include LIB_FILE
+CLEAN.include SO_FILE
 
 directory "lib"
 file LIB_FILE => [SO_FILE, "lib"] do |t|
   copy t.source, t.name
 end
+CLEAN.include LIB_FILE
 
 Rake::TestTask.new do |t|
   t.test_files = FileList["tests/test_*.rb"]
 end
-task test: [TEST_MODEL, LIB_FILE]
 
-file TEST_MODEL do
-  Dir.chdir "../.." do
-    sh "./models/download-ggml-model.sh base.en"
+TEST_MEMORY_VIEW = "tests/jfk_reader/jfk_reader.#{RbConfig::CONFIG['DLEXT']}"
+file TEST_MEMORY_VIEW => "tests/jfk_reader/jfk_reader.c" do |t|
+  Dir.chdir "tests/jfk_reader" do
+    ruby "extconf.rb"
+    sh "make"
   end
 end
+CLEAN.include "tests/jfk_reader/jfk_reader.{o,#{RbConfig::CONFIG['DLEXT']}}"
+
+task test: [LIB_FILE, TEST_MEMORY_VIEW]

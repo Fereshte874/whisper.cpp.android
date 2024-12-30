@@ -1,4 +1,5 @@
 #include <ruby.h>
+#include <ruby/memory_view.h>
 #include "ruby_whisper.h"
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
@@ -35,13 +36,25 @@ extern "C" {
 VALUE mWhisper;
 VALUE cContext;
 VALUE cParams;
+VALUE eError;
+
+VALUE cSegment;
+VALUE cModel;
 
 static ID id_to_s;
 static ID id_call;
 static ID id___method__;
 static ID id_to_enum;
+static ID id_length;
+static ID id_next;
+static ID id_new;
+static ID id_to_path;
+static ID id_pre_converted_models;
 
 static bool is_log_callback_finalized = false;
+
+// High level API
+static VALUE rb_whisper_segment_initialize(VALUE context, int index);
 
 /*
  * call-seq:
@@ -100,13 +113,13 @@ static VALUE ruby_whisper_s_finalize_log_callback(VALUE self, VALUE id) {
  *   log_set ->(level, buffer, user_data) { ... }, user_data -> nil
  */
 static VALUE ruby_whisper_s_log_set(VALUE self, VALUE log_callback, VALUE user_data) {
-  VALUE old_callback = rb_iv_get(self, "@log_callback");
+  VALUE old_callback = rb_iv_get(self, "log_callback");
   if (!NIL_P(old_callback)) {
     rb_undefine_finalizer(old_callback);
   }
 
-  rb_iv_set(self, "@log_callback", log_callback);
-  rb_iv_set(self, "@user_data", user_data);
+  rb_iv_set(self, "log_callback", log_callback);
+  rb_iv_set(self, "user_data", user_data);
 
   VALUE finalize_log_callback = rb_funcall(mWhisper, rb_intern("method"), 1, rb_str_new2("finalize_log_callback"));
   rb_define_finalizer(log_callback, finalize_log_callback);
@@ -115,8 +128,8 @@ static VALUE ruby_whisper_s_log_set(VALUE self, VALUE log_callback, VALUE user_d
     if (is_log_callback_finalized) {
       return;
     }
-    VALUE log_callback = rb_iv_get(mWhisper, "@log_callback");
-    VALUE udata = rb_iv_get(mWhisper, "@user_data");
+    VALUE log_callback = rb_iv_get(mWhisper, "log_callback");
+    VALUE udata = rb_iv_get(mWhisper, "user_data");
     rb_funcall(log_callback, id_call, 3, INT2NUM(level), rb_str_new2(buffer), udata);
   }, nullptr);
 
@@ -177,10 +190,74 @@ static ruby_whisper_callback_container * rb_whisper_callback_container_allocate(
   return container;
 }
 
+static void new_segment_callback(struct whisper_context *ctx, struct whisper_state *state, int n_new, void *user_data) {
+  const ruby_whisper_callback_container *container = (ruby_whisper_callback_container *)user_data;
+
+  // Currently, doesn't support state because
+  // those require to resolve GC-related problems.
+  if (!NIL_P(container->callback)) {
+    rb_funcall(container->callback, id_call, 4, *container->context, Qnil, INT2NUM(n_new), container->user_data);
+  }
+  const long callbacks_len = RARRAY_LEN(container->callbacks);
+  if (0 == callbacks_len) {
+    return;
+  }
+  const int n_segments = whisper_full_n_segments_from_state(state);
+  for (int i = n_new; i > 0; i--) {
+    int i_segment = n_segments - i;
+    VALUE segment = rb_whisper_segment_initialize(*container->context, i_segment);
+    for (int j = 0; j < callbacks_len; j++) {
+      VALUE cb = rb_ary_entry(container->callbacks, j);
+      rb_funcall(cb, id_call, 1, segment);
+    }
+  }
+}
+
+static void progress_callback(struct whisper_context *ctx, struct whisper_state *state, int progress_cur, void *user_data) {
+  const ruby_whisper_callback_container *container = (ruby_whisper_callback_container *)user_data;
+  const VALUE progress = INT2NUM(progress_cur);
+  // Currently, doesn't support state because
+  // those require to resolve GC-related problems.
+  if (!NIL_P(container->callback)) {
+    rb_funcall(container->callback, id_call, 4, *container->context, Qnil, progress, container->user_data);
+  }
+  const long callbacks_len = RARRAY_LEN(container->callbacks);
+  if (0 == callbacks_len) {
+    return;
+  }
+  for (int j = 0; j < callbacks_len; j++) {
+    VALUE cb = rb_ary_entry(container->callbacks, j);
+    rb_funcall(cb, id_call, 1, progress);
+  }
+}
+
+static bool abort_callback(void * user_data) {
+  const ruby_whisper_callback_container *container = (ruby_whisper_callback_container *)user_data;
+  if (!NIL_P(container->callback)) {
+    VALUE result = rb_funcall(container->callback, id_call, 1, container->user_data);
+    if (!NIL_P(result) && Qfalse != result) {
+      return true;
+    }
+  }
+  const long callbacks_len = RARRAY_LEN(container->callbacks);
+  if (0 == callbacks_len) {
+    return false;
+  }
+  for (int j = 0; j < callbacks_len; j++) {
+    VALUE cb = rb_ary_entry(container->callbacks, j);
+    VALUE result = rb_funcall(cb, id_call, 1, container->user_data);
+    if (!NIL_P(result) && Qfalse != result) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static VALUE ruby_whisper_params_allocate(VALUE klass) {
   ruby_whisper_params *rwp;
   rwp = ALLOC(ruby_whisper_params);
   rwp->params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+  rwp->diarize = false;
   rwp->new_segment_callback_container = rb_whisper_callback_container_allocate();
   rwp->progress_callback_container = rb_whisper_callback_container_allocate();
   rwp->abort_callback_container = rb_whisper_callback_container_allocate();
@@ -189,7 +266,9 @@ static VALUE ruby_whisper_params_allocate(VALUE klass) {
 
 /*
  * call-seq:
+ *   new("base.en") -> Whisper::Context
  *   new("path/to/model.bin") -> Whisper::Context
+ *   new(Whisper::Model::URI.new("https://example.net/uri/of/model.bin")) -> Whisper::Context
  */
 static VALUE ruby_whisper_initialize(int argc, VALUE *argv, VALUE self) {
   ruby_whisper *rw;
@@ -199,6 +278,14 @@ static VALUE ruby_whisper_initialize(int argc, VALUE *argv, VALUE self) {
   rb_scan_args(argc, argv, "01", &whisper_model_file_path);
   Data_Get_Struct(self, ruby_whisper, rw);
 
+  VALUE pre_converted_models = rb_funcall(cModel, id_pre_converted_models, 0);
+  VALUE pre_converted_model = rb_hash_aref(pre_converted_models, whisper_model_file_path);
+  if (!NIL_P(pre_converted_model)) {
+    whisper_model_file_path = pre_converted_model;
+  }
+  if (rb_respond_to(whisper_model_file_path, id_to_path)) {
+    whisper_model_file_path = rb_funcall(whisper_model_file_path, id_to_path, 0);
+  }
   if (!rb_respond_to(whisper_model_file_path, id_to_s)) {
     rb_raise(rb_eRuntimeError, "Expected file path to model to initialize Whisper::Context");
   }
@@ -209,8 +296,25 @@ static VALUE ruby_whisper_initialize(int argc, VALUE *argv, VALUE self) {
   return self;
 }
 
-// High level API
-static VALUE rb_whisper_segment_initialize(VALUE context, int index);
+static void register_callbacks(ruby_whisper_params * rwp, VALUE * self) {
+  if (!NIL_P(rwp->new_segment_callback_container->callback) || 0 != RARRAY_LEN(rwp->new_segment_callback_container->callbacks)) {
+    rwp->new_segment_callback_container->context = self;
+    rwp->params.new_segment_callback = new_segment_callback;
+    rwp->params.new_segment_callback_user_data = rwp->new_segment_callback_container;
+  }
+
+  if (!NIL_P(rwp->progress_callback_container->callback) || 0 != RARRAY_LEN(rwp->progress_callback_container->callbacks)) {
+    rwp->progress_callback_container->context = self;
+    rwp->params.progress_callback = progress_callback;
+    rwp->params.progress_callback_user_data = rwp->progress_callback_container;
+  }
+
+  if (!NIL_P(rwp->abort_callback_container->callback) || 0 != RARRAY_LEN(rwp->abort_callback_container->callbacks)) {
+    rwp->abort_callback_container->context = self;
+    rwp->params.abort_callback = abort_callback;
+    rwp->params.abort_callback_user_data = rwp->abort_callback_container;
+  }
+}
 
 /*
  * transcribe a single file
@@ -332,80 +436,7 @@ static VALUE ruby_whisper_transcribe(int argc, VALUE *argv, VALUE self) {
     rwp->params.encoder_begin_callback_user_data = &is_aborted;
   }
 
-  if (!NIL_P(rwp->new_segment_callback_container->callback) || 0 != RARRAY_LEN(rwp->new_segment_callback_container->callbacks)) {
-    rwp->params.new_segment_callback = [](struct whisper_context * ctx, struct whisper_state * state, int n_new, void * user_data) {
-      const ruby_whisper_callback_container *container = (ruby_whisper_callback_container *)user_data;
-
-      // Currently, doesn't support state because
-      // those require to resolve GC-related problems.
-      if (!NIL_P(container->callback)) {
-        rb_funcall(container->callback, id_call, 4, *container->context, Qnil, INT2NUM(n_new), container->user_data);
-      }
-      const long callbacks_len = RARRAY_LEN(container->callbacks);
-      if (0 == callbacks_len) {
-        return;
-      }
-      const int n_segments = whisper_full_n_segments_from_state(state);
-      for (int i = n_new; i > 0; i--) {
-        int i_segment = n_segments - i;
-        VALUE segment = rb_whisper_segment_initialize(*container->context, i_segment);
-        for (int j = 0; j < callbacks_len; j++) {
-          VALUE cb = rb_ary_entry(container->callbacks, j);
-          rb_funcall(cb, id_call, 1, segment);
-        }
-      }
-    };
-    rwp->new_segment_callback_container->context = &self;
-    rwp->params.new_segment_callback_user_data = rwp->new_segment_callback_container;
-  }
-
-  if (!NIL_P(rwp->progress_callback_container->callback) || 0 != RARRAY_LEN(rwp->progress_callback_container->callbacks)) {
-    rwp->params.progress_callback = [](struct whisper_context *ctx, struct whisper_state * /*state*/, int progress_cur, void *user_data) {
-      const ruby_whisper_callback_container *container = (ruby_whisper_callback_container *)user_data;
-      const VALUE progress = INT2NUM(progress_cur);
-      // Currently, doesn't support state because
-      // those require to resolve GC-related problems.
-      if (!NIL_P(container->callback)) {
-        rb_funcall(container->callback, id_call, 4, *container->context, Qnil, progress, container->user_data);
-      }
-      const long callbacks_len = RARRAY_LEN(container->callbacks);
-      if (0 == callbacks_len) {
-        return;
-      }
-      for (int j = 0; j < callbacks_len; j++) {
-        VALUE cb = rb_ary_entry(container->callbacks, j);
-        rb_funcall(cb, id_call, 1, progress);
-      }
-    };
-    rwp->progress_callback_container->context = &self;
-    rwp->params.progress_callback_user_data = rwp->progress_callback_container;
-  }
-
-  if (!NIL_P(rwp->abort_callback_container->callback) || 0 != RARRAY_LEN(rwp->abort_callback_container->callbacks)) {
-    rwp->params.abort_callback = [](void * user_data) {
-      const ruby_whisper_callback_container *container = (ruby_whisper_callback_container *)user_data;
-      if (!NIL_P(container->callback)) {
-        VALUE result = rb_funcall(container->callback, id_call, 1, container->user_data);
-        if (!NIL_P(result) && Qfalse != result) {
-          return true;
-        }
-      }
-      const long callbacks_len = RARRAY_LEN(container->callbacks);
-      if (0 == callbacks_len) {
-        return false;
-      }
-      for (int j = 0; j < callbacks_len; j++) {
-        VALUE cb = rb_ary_entry(container->callbacks, j);
-        VALUE result = rb_funcall(cb, id_call, 1, container->user_data);
-        if (!NIL_P(result) && Qfalse != result) {
-          return true;
-        }
-      }
-      return false;
-    };
-    rwp->abort_callback_container->context = &self;
-    rwp->params.abort_callback_user_data = rwp->abort_callback_container;
-  }
+  register_callbacks(rwp, &self);
 
   if (whisper_full_parallel(rw->context, rwp->params, pcmf32.data(), pcmf32.size(), 1) != 0) {
     fprintf(stderr, "failed to process audio\n");
@@ -545,6 +576,170 @@ VALUE ruby_whisper_model_type(VALUE self) {
 }
 
 /*
+ * Run the entire model: PCM -> log mel spectrogram -> encoder -> decoder -> text
+ * Not thread safe for same context
+ * Uses the specified decoding strategy to obtain the text.
+ *
+ * call-seq:
+ *   full(params, samples, n_samples) -> nil
+ *   full(params, samples) -> nil
+ *
+ * The second argument +samples+ must be an array of samples, respond to :length, or be a MemoryView of an array of float. It must be 32 bit float PCM audio data.
+ */
+VALUE ruby_whisper_full(int argc, VALUE *argv, VALUE self) {
+  if (argc < 2 || argc > 3) {
+    rb_raise(rb_eArgError, "wrong number of arguments (given %d, expected 2..3)", argc);
+  }
+
+  ruby_whisper *rw;
+  ruby_whisper_params *rwp;
+  Data_Get_Struct(self, ruby_whisper, rw);
+  VALUE params = argv[0];
+  Data_Get_Struct(params, ruby_whisper_params, rwp);
+  VALUE samples = argv[1];
+  int n_samples;
+  rb_memory_view_t view;
+  const bool memory_view_available_p = rb_memory_view_available_p(samples);
+  if (argc == 3) {
+    n_samples = NUM2INT(argv[2]);
+    if (TYPE(samples) == T_ARRAY) {
+      if (RARRAY_LEN(samples) < n_samples) {
+        rb_raise(rb_eArgError, "samples length %ld is less than n_samples %d", RARRAY_LEN(samples), n_samples);
+      }
+    }
+    // Should check when samples.respond_to?(:length)?
+  } else {
+    if (TYPE(samples) == T_ARRAY) {
+      n_samples = RARRAY_LEN(samples);
+    } else if (memory_view_available_p) {
+      if (!rb_memory_view_get(samples, &view, RUBY_MEMORY_VIEW_SIMPLE)) {
+        view.obj = Qnil;
+        rb_raise(rb_eArgError, "unable to get a memory view");
+      }
+      n_samples = view.byte_size / view.item_size;
+    } else if (rb_respond_to(samples, id_length)) {
+      n_samples = NUM2INT(rb_funcall(samples, id_length, 0));
+    } else {
+      rb_raise(rb_eArgError, "samples must respond to :length or be a MemoryView of an array of flaot when n_samples is not given");
+    }
+  }
+  float * c_samples = (float *)malloc(n_samples * sizeof(float));
+  if (memory_view_available_p)  {
+    c_samples = (float *)view.data;
+  } else {
+    if (TYPE(samples) == T_ARRAY) {
+      for (int i = 0; i < n_samples; i++) {
+        c_samples[i] = RFLOAT_VALUE(rb_ary_entry(samples, i));
+      }
+    } else {
+      // TODO: use rb_block_call
+      VALUE iter = rb_funcall(samples, id_to_enum, 1, rb_str_new2("each"));
+      for (int i = 0; i < n_samples; i++) {
+        // TODO: check if iter is exhausted and raise ArgumentError appropriately
+        VALUE sample = rb_funcall(iter, id_next, 0);
+        c_samples[i] = RFLOAT_VALUE(sample);
+      }
+    }
+  }
+  register_callbacks(rwp, &self);
+  const int result = whisper_full(rw->context, rwp->params, c_samples, n_samples);
+  if (0 == result) {
+    return Qnil;
+  } else {
+    rb_exc_raise(rb_funcall(eError, id_new, 1, result));
+  }
+}
+
+/*
+ * Split the input audio in chunks and process each chunk separately using whisper_full_with_state()
+ * Result is stored in the default state of the context
+ * Not thread safe if executed in parallel on the same context.
+ * It seems this approach can offer some speedup in some cases.
+ * However, the transcription accuracy can be worse at the beginning and end of each chunk.
+ *
+ * call-seq:
+ *   full_parallel(params, samples) -> nil
+ *   full_parallel(params, samples, n_samples) -> nil
+ *   full_parallel(params, samples, n_samples, n_processors) -> nil
+ *   full_parallel(params, samples, nil, n_processors) -> nil
+ */
+static VALUE ruby_whisper_full_parallel(int argc, VALUE *argv,VALUE self) {
+  if (argc < 2 || argc > 4) {
+    rb_raise(rb_eArgError, "wrong number of arguments (given %d, expected 2..3)", argc);
+  }
+
+  ruby_whisper *rw;
+  ruby_whisper_params *rwp;
+  Data_Get_Struct(self, ruby_whisper, rw);
+  VALUE params = argv[0];
+  Data_Get_Struct(params, ruby_whisper_params, rwp);
+  VALUE samples = argv[1];
+  int n_samples;
+  int n_processors;
+  rb_memory_view_t view;
+  const bool memory_view_available_p = rb_memory_view_available_p(samples);
+  switch (argc) {
+  case 2:
+    n_processors = 1;
+    break;
+  case 3:
+    n_processors = 1;
+    break;
+  case 4:
+    n_processors = NUM2INT(argv[3]);
+    break;
+  }
+  if (argc >= 3 && !NIL_P(argv[2])) {
+    n_samples = NUM2INT(argv[2]);
+    if (TYPE(samples) == T_ARRAY) {
+      if (RARRAY_LEN(samples) < n_samples) {
+        rb_raise(rb_eArgError, "samples length %ld is less than n_samples %d", RARRAY_LEN(samples), n_samples);
+      }
+    }
+    // Should check when samples.respond_to?(:length)?
+  } else if (memory_view_available_p) {
+    if (!rb_memory_view_get(samples, &view, RUBY_MEMORY_VIEW_SIMPLE)) {
+      view.obj = Qnil;
+      rb_raise(rb_eArgError, "unable to get a memory view");
+    }
+    n_samples = view.byte_size / view.item_size;
+  } else {
+    if (TYPE(samples) == T_ARRAY) {
+      n_samples = RARRAY_LEN(samples);
+    } else if (rb_respond_to(samples, id_length)) {
+      n_samples = NUM2INT(rb_funcall(samples, id_length, 0));
+    } else {
+      rb_raise(rb_eArgError, "samples must respond to :length or be a MemoryView of an array of flaot when n_samples is not given");
+    }
+  }
+  float * c_samples = (float *)malloc(n_samples * sizeof(float));
+  if (memory_view_available_p) {
+    c_samples = (float *)view.data;
+  } else {
+    if (TYPE(samples) == T_ARRAY) {
+      for (int i = 0; i < n_samples; i++) {
+        c_samples[i] = RFLOAT_VALUE(rb_ary_entry(samples, i));
+      }
+    } else {
+      // FIXME: use rb_block_call
+      VALUE iter = rb_funcall(samples, id_to_enum, 1, rb_str_new2("each"));
+      for (int i = 0; i < n_samples; i++) {
+        // TODO: check if iter is exhausted and raise ArgumentError
+        VALUE sample = rb_funcall(iter, id_next, 0);
+        c_samples[i] = RFLOAT_VALUE(sample);
+      }
+    }
+  }
+  register_callbacks(rwp, &self);
+  const int result = whisper_full_parallel(rw->context, rwp->params, c_samples, n_samples, n_processors);
+  if (0 == result) {
+    return Qnil;
+  } else {
+    rb_exc_raise(rb_funcall(eError, id_new, 1, result));
+  }
+}
+
+/*
  * Number of segments.
  *
  * call-seq:
@@ -638,6 +833,18 @@ static VALUE ruby_whisper_full_get_segment_text(VALUE self, VALUE i_segment) {
   const int c_i_segment = ruby_whisper_full_check_segment_index(rw, i_segment);
   const char * text = whisper_full_get_segment_text(rw->context, c_i_segment);
   return rb_str_new2(text);
+}
+
+/*
+ * call-seq:
+ *   full_get_segment_no_speech_prob -> Float
+ */
+static VALUE ruby_whisper_full_get_segment_no_speech_prob(VALUE self, VALUE i_segment) {
+  ruby_whisper *rw;
+  Data_Get_Struct(self, ruby_whisper, rw);
+  const int c_i_segment = ruby_whisper_full_check_segment_index(rw, i_segment);
+  const float no_speech_prob = whisper_full_get_segment_no_speech_prob(rw->context, c_i_segment);
+  return DBL2NUM(no_speech_prob);
 }
 
 /*
@@ -796,19 +1003,19 @@ static VALUE ruby_whisper_params_get_suppress_blank(VALUE self) {
 }
 /*
  * call-seq:
- *   suppress_non_speech_tokens = force_suppress -> force_suppress
+ *   suppress_nst = force_suppress -> force_suppress
  */
-static VALUE ruby_whisper_params_set_suppress_non_speech_tokens(VALUE self, VALUE value) {
-  BOOL_PARAMS_SETTER(self, suppress_non_speech_tokens, value)
+static VALUE ruby_whisper_params_set_suppress_nst(VALUE self, VALUE value) {
+  BOOL_PARAMS_SETTER(self, suppress_nst, value)
 }
 /*
  * If true, suppresses non-speech-tokens.
  *
  * call-seq:
- *   suppress_non_speech_tokens -> bool
+ *   suppress_nst -> bool
  */
-static VALUE ruby_whisper_params_get_suppress_non_speech_tokens(VALUE self) {
-  BOOL_PARAMS_GETTER(self, suppress_non_speech_tokens)
+static VALUE ruby_whisper_params_get_suppress_nst(VALUE self) {
+  BOOL_PARAMS_GETTER(self, suppress_nst)
 }
 /*
  * If true, enables token-level timestamps.
@@ -1079,6 +1286,25 @@ static VALUE ruby_whisper_params_set_logprob_thold(VALUE self, VALUE value) {
   return value;
 }
 /*
+ * call-seq:
+ *   no_speech_thold -> Float
+ */
+static VALUE ruby_whisper_params_get_no_speech_thold(VALUE self) {
+  ruby_whisper_params *rwp;
+  Data_Get_Struct(self, ruby_whisper_params, rwp);
+  return DBL2NUM(rwp->params.no_speech_thold);
+}
+/*
+ * call-seq:
+ *   no_speech_thold = threshold -> threshold
+ */
+static VALUE ruby_whisper_params_set_no_speech_thold(VALUE self, VALUE value) {
+  ruby_whisper_params *rwp;
+  Data_Get_Struct(self, ruby_whisper_params, rwp);
+  rwp->params.no_speech_thold = RFLOAT_VALUE(value);
+  return value;
+}
+/*
  * Sets new segment callback, called for every newly generated text segment.
  *
  *   params.new_segment_callback = ->(context, _, n_new, user_data) {
@@ -1173,9 +1399,6 @@ typedef struct {
 typedef struct {
   VALUE context;
 } ruby_whisper_model;
-
-VALUE cSegment;
-VALUE cModel;
 
 static void rb_whisper_segment_mark(ruby_whisper_segment *rws) {
   rb_gc_mark(rws->context);
@@ -1348,6 +1571,18 @@ static VALUE ruby_whisper_segment_get_text(VALUE self) {
   return rb_str_new2(text);
 }
 
+/*
+ * call-seq:
+ *   no_speech_prob -> Float
+ */
+static VALUE ruby_whisper_segment_get_no_speech_prob(VALUE self) {
+  ruby_whisper_segment *rws;
+  Data_Get_Struct(self, ruby_whisper_segment, rws);
+  ruby_whisper *rw;
+  Data_Get_Struct(rws->context, ruby_whisper, rw);
+  return DBL2NUM(whisper_full_get_segment_no_speech_prob(rw->context, rws->index));
+}
+
 static void rb_whisper_model_mark(ruby_whisper_model *rwm) {
   rb_gc_mark(rwm->context);
 }
@@ -1518,15 +1753,61 @@ static VALUE ruby_whisper_c_model_type(VALUE self) {
   return rb_str_new2(whisper_model_type_readable(rw->context));
 }
 
+static VALUE ruby_whisper_error_initialize(VALUE self, VALUE code) {
+  const int c_code = NUM2INT(code);
+  char *raw_message;
+  switch (c_code) {
+  case -2:
+    raw_message = "failed to compute log mel spectrogram";
+    break;
+  case -3:
+    raw_message = "failed to auto-detect language";
+    break;
+  case -4:
+    raw_message = "too many decoders requested";
+    break;
+  case -5:
+    raw_message = "audio_ctx is larger than the maximum allowed";
+    break;
+  case -6:
+    raw_message = "failed to encode";
+    break;
+  case -7:
+    raw_message = "whisper_kv_cache_init() failed for self-attention cache";
+    break;
+  case -8:
+    raw_message = "failed to decode";
+    break;
+  case -9:
+    raw_message = "failed to decode";
+    break;
+  default:
+    raw_message = "unknown error";
+    break;
+  }
+  const VALUE message = rb_str_new2(raw_message);
+  rb_call_super(1, &message);
+  rb_iv_set(self, "@code", code);
+
+  return self;
+}
+
+
 void Init_whisper() {
   id_to_s = rb_intern("to_s");
   id_call = rb_intern("call");
   id___method__ = rb_intern("__method__");
   id_to_enum = rb_intern("to_enum");
+  id_length = rb_intern("length");
+  id_next = rb_intern("next");
+  id_new = rb_intern("new");
+  id_to_path = rb_intern("to_path");
+  id_pre_converted_models = rb_intern("pre_converted_models");
 
   mWhisper = rb_define_module("Whisper");
   cContext = rb_define_class_under(mWhisper, "Context", rb_cObject);
   cParams  = rb_define_class_under(mWhisper, "Params", rb_cObject);
+  eError   = rb_define_class_under(mWhisper, "Error", rb_eStandardError);
 
   rb_define_const(mWhisper, "LOG_LEVEL_NONE", INT2NUM(GGML_LOG_LEVEL_NONE));
   rb_define_const(mWhisper, "LOG_LEVEL_INFO", INT2NUM(GGML_LOG_LEVEL_INFO));
@@ -1564,6 +1845,9 @@ void Init_whisper() {
   rb_define_method(cContext, "full_get_segment_t1", ruby_whisper_full_get_segment_t1, 1);
   rb_define_method(cContext, "full_get_segment_speaker_turn_next", ruby_whisper_full_get_segment_speaker_turn_next, 1);
   rb_define_method(cContext, "full_get_segment_text", ruby_whisper_full_get_segment_text, 1);
+  rb_define_method(cContext, "full_get_segment_no_speech_prob", ruby_whisper_full_get_segment_no_speech_prob, 1);
+  rb_define_method(cContext, "full", ruby_whisper_full, -1);
+  rb_define_method(cContext, "full_parallel", ruby_whisper_full_parallel, -1);
 
   rb_define_alloc_func(cParams, ruby_whisper_params_allocate);
 
@@ -1585,8 +1869,8 @@ void Init_whisper() {
   rb_define_method(cParams, "print_timestamps=", ruby_whisper_params_set_print_timestamps, 1);
   rb_define_method(cParams, "suppress_blank", ruby_whisper_params_get_suppress_blank, 0);
   rb_define_method(cParams, "suppress_blank=", ruby_whisper_params_set_suppress_blank, 1);
-  rb_define_method(cParams, "suppress_non_speech_tokens", ruby_whisper_params_get_suppress_non_speech_tokens, 0);
-  rb_define_method(cParams, "suppress_non_speech_tokens=", ruby_whisper_params_set_suppress_non_speech_tokens, 1);
+  rb_define_method(cParams, "suppress_nst", ruby_whisper_params_get_suppress_nst, 0);
+  rb_define_method(cParams, "suppress_nst=", ruby_whisper_params_set_suppress_nst, 1);
   rb_define_method(cParams, "token_timestamps", ruby_whisper_params_get_token_timestamps, 0);
   rb_define_method(cParams, "token_timestamps=", ruby_whisper_params_set_token_timestamps, 1);
   rb_define_method(cParams, "split_on_word", ruby_whisper_params_get_split_on_word, 0);
@@ -1615,6 +1899,8 @@ void Init_whisper() {
   rb_define_method(cParams, "entropy_thold=", ruby_whisper_params_set_entropy_thold, 1);
   rb_define_method(cParams, "logprob_thold", ruby_whisper_params_get_logprob_thold, 0);
   rb_define_method(cParams, "logprob_thold=", ruby_whisper_params_set_logprob_thold, 1);
+  rb_define_method(cParams, "no_speech_thold", ruby_whisper_params_get_no_speech_thold, 0);
+  rb_define_method(cParams, "no_speech_thold=", ruby_whisper_params_set_no_speech_thold, 1);
 
   rb_define_method(cParams, "new_segment_callback=", ruby_whisper_params_set_new_segment_callback, 1);
   rb_define_method(cParams, "new_segment_callback_user_data=", ruby_whisper_params_set_new_segment_callback_user_data, 1);
@@ -1622,6 +1908,9 @@ void Init_whisper() {
   rb_define_method(cParams, "progress_callback_user_data=", ruby_whisper_params_set_progress_callback_user_data, 1);
   rb_define_method(cParams, "abort_callback=", ruby_whisper_params_set_abort_callback, 1);
   rb_define_method(cParams, "abort_callback_user_data=", ruby_whisper_params_set_abort_callback_user_data, 1);
+
+  rb_define_attr(eError, "code", true, false);
+  rb_define_method(eError, "initialize", ruby_whisper_error_initialize, 1);
 
   // High leve
   cSegment  = rb_define_class_under(mWhisper, "Segment", rb_cObject);
@@ -1635,6 +1924,7 @@ void Init_whisper() {
   rb_define_method(cSegment, "end_time", ruby_whisper_segment_get_end_time, 0);
   rb_define_method(cSegment, "speaker_next_turn?", ruby_whisper_segment_get_speaker_turn_next, 0);
   rb_define_method(cSegment, "text", ruby_whisper_segment_get_text, 0);
+  rb_define_method(cSegment, "no_speech_prob", ruby_whisper_segment_get_no_speech_prob, 0);
 
   cModel = rb_define_class_under(mWhisper, "Model", rb_cObject);
   rb_define_alloc_func(cModel, ruby_whisper_model_allocate);

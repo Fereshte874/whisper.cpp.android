@@ -28,9 +28,9 @@ jobs:
             -w /workspace ${{ env.ubuntu_image }} /bin/sh -c '
             set -e
             apt update
-            apt install -y build-essential libsdl2-dev
-            make
-            make stream'
+            apt install -y build-essential libsdl2-dev cmake
+            cmake -B build
+            cmake --build build --config Release -j $(nproc)'
 
   macOS-latest:
     runs-on: macOS-latest
@@ -42,30 +42,30 @@ jobs:
       - name: Dependencies
         run: |
           brew update
-          brew install sdl2
+          brew install sdl2 cmake
 
       - name: Build
         run: |
-          make
-          make stream
+          cmake -B build
+          cmake --build build --config Release
 
-  freeBSD-latest:
-    runs-on: macos-12
-
-    steps:
-      - name: Clone
-        uses: actions/checkout@v4
-
-      - name: Build
-        uses: cross-platform-actions/action@v0.24.0
-        with:
-          operating_system: freebsd
-          version: '13.3'
-          run: |
-            sudo pkg update
-            sudo pkg install -y gmake sdl2
-            gmake
-            gmake stream
+#  freeBSD-latest:
+#    runs-on: macos-12
+#
+#    steps:
+#      - name: Clone
+#        uses: actions/checkout@v4
+#
+#      - name: Build
+#        uses: cross-platform-actions/action@v0.24.0
+#        with:
+#          operating_system: freebsd
+#          version: '13.3'
+#          run: |
+#            sudo pkg update
+#            sudo pkg install -y gmake sdl2 cmake
+#            cmake -B build
+#            cmake --build build --config Release
 
   ubuntu-latest-gcc:
     runs-on: ubuntu-latest
@@ -280,25 +280,10 @@ jobs:
             mingw-w64-${{matrix.env}}-SDL2
             mingw-w64-${{matrix.env}}-openblas
 
-      - name: Build using make
-        shell: msys2 {0}
-        run: |
-            make -j $(nproc)
-
-      - name: Clean after building using make
-        shell: msys2 {0}
-        run: |
-            make clean
-
-      - name: Build using make w/ OpenBLAS
-        shell: msys2 {0}
-        run: |
-            make GGML_OPENBLAS=1 -j $(nproc)
-
       - name: Build using CMake
         shell: msys2 {0}
         run: |
-            cmake -B build
+            cmake -B build -DWHISPER_SDL2=ON
             cmake --build build --config ${{ matrix.build }} -j $(nproc)
 
       - name: Clean after building using CMake
@@ -445,71 +430,72 @@ jobs:
           name: whisper-blas-bin-${{ matrix.arch }}
           path: build/bin/${{ matrix.build }}
 
-  windows-cublas:
-    runs-on: windows-2019
-
-    strategy:
-      matrix:
-        build: [Release]
-        arch: [x64]
-        cublas: [ON]
-        sdl2: [ON]
-        cuda-toolkit: [12.2.0, 11.8.0]
-        include:
-          - arch: x64
-            s2arc: x64
-          - sdl2: ON
-            s2ver: 2.28.5
-
-    steps:
-      - name: Clone
-        uses: actions/checkout@v4
-
-      - name: Add msbuild to PATH
-        uses: microsoft/setup-msbuild@v2
-
-      - name: Install CUDA Toolkit
-        id: cuda-toolkit
-        uses: Jimver/cuda-toolkit@v0.2.15
-        with:
-          cuda: '${{ matrix.cuda-toolkit }}'
-
-      - name: Fetch SDL2 and set SDL2_DIR
-        if: matrix.sdl2 == 'ON'
-        run: |
-          C:/msys64/usr/bin/wget.exe -qO sdl2.zip https://github.com/libsdl-org/SDL/releases/download/release-${{ matrix.s2ver }}/SDL2-devel-${{ matrix.s2ver }}-VC.zip
-          7z x sdl2.zip
-          echo "SDL2_DIR=$env:GITHUB_WORKSPACE/SDL2-${{ matrix.s2ver }}/cmake" >> $env:GITHUB_ENV
-
-      - name: Configure
-        run: >
-          cmake -S . -B ./build -A ${{ matrix.arch }}
-          -DCMAKE_BUILD_TYPE=${{ matrix.build }}
-          -DGGML_CUDA=${{ matrix.cublas }}
-          -DWHISPER_SDL2=${{ matrix.sdl2 }}
-
-      - name: Build ${{ matrix.cuda-toolkit }}
-        run: |
-          cd ./build
-          cmake --build . --config ${{ matrix.build }}
-
-      - name: Copy CUDA DLLs
-        run: >
-          Copy-Item -PassThru
-          -Path "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/bin/*.dll"
-          -Include cudart64_*,cublas64_*,cublasLt64_*
-          -Destination build/bin/${{ matrix.build }}
-
-      - name: Copy SDL2.dll
-        if: matrix.sdl2 == 'ON'
-        run: copy "$env:SDL2_DIR/../lib/${{ matrix.s2arc }}/SDL2.dll" build/bin/${{ matrix.build }}
-
-      - name: Upload binaries
-        if: matrix.sdl2 == 'ON'
-        uses: actions/upload-artifact@v4
-        with:
-          name: whisper-cublas-${{ matrix.cuda-toolkit }}-bin-${{ matrix.arch }}
-          path: build/bin/${{ matrix.build }}
+# TODO: fix and re-enable
+#  windows-cublas:
+#    runs-on: windows-2019
+#
+#    strategy:
+#      matrix:
+#        build: [Release]
+#        arch: [x64]
+#        cublas: [ON]
+#        sdl2: [ON]
+#        cuda-toolkit: [12.2.0, 11.8.0]
+#        include:
+#          - arch: x64
+#            s2arc: x64
+#          - sdl2: ON
+#            s2ver: 2.28.5
+#
+#    steps:
+#      - name: Clone
+#        uses: actions/checkout@v4
+#
+#      - name: Add msbuild to PATH
+#        uses: microsoft/setup-msbuild@v2
+#
+#      - name: Install CUDA Toolkit
+#        id: cuda-toolkit
+#        uses: Jimver/cuda-toolkit@v0.2.15
+#        with:
+#          cuda: '${{ matrix.cuda-toolkit }}'
+#
+#      - name: Fetch SDL2 and set SDL2_DIR
+#        if: matrix.sdl2 == 'ON'
+#        run: |
+#          C:/msys64/usr/bin/wget.exe -qO sdl2.zip https://github.com/libsdl-org/SDL/releases/download/release-${{ matrix.s2ver }}/SDL2-devel-${{ matrix.s2ver }}-VC.zip
+#          7z x sdl2.zip
+#          echo "SDL2_DIR=$env:GITHUB_WORKSPACE/SDL2-${{ matrix.s2ver }}/cmake" >> $env:GITHUB_ENV
+#
+#      - name: Configure
+#        run: >
+#          cmake -S . -B ./build -A ${{ matrix.arch }}
+#          -DCMAKE_BUILD_TYPE=${{ matrix.build }}
+#          -DGGML_CUDA=${{ matrix.cublas }}
+#          -DWHISPER_SDL2=${{ matrix.sdl2 }}
+#
+#      - name: Build ${{ matrix.cuda-toolkit }}
+#        run: |
+#          cd ./build
+#          cmake --build . --config ${{ matrix.build }}
+#
+#      - name: Copy CUDA DLLs
+#        run: >
+#          Copy-Item -PassThru
+#          -Path "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/bin/*.dll"
+#          -Include cudart64_*,cublas64_*,cublasLt64_*
+#          -Destination build/bin/${{ matrix.build }}
+#
+#      - name: Copy SDL2.dll
+#        if: matrix.sdl2 == 'ON'
+#        run: copy "$env:SDL2_DIR/../lib/${{ matrix.s2arc }}/SDL2.dll" build/bin/${{ matrix.build }}
+#
+#      - name: Upload binaries
+#        if: matrix.sdl2 == 'ON'
+#        uses: actions/upload-artifact@v4
+#        with:
+#          name: whisper-cublas-${{ matrix.cuda-toolkit }}-bin-${{ matrix.arch }}
+#          path: build/bin/${{ matrix.build }}
 
   emscripten:
     runs-on: ubuntu-latest
@@ -533,7 +519,7 @@ jobs:
           emcmake cmake . -DCMAKE_BUILD_TYPE=${{ matrix.build }}
           make
 
-  ios:
+  ios-xcode-build:
     runs-on: macos-latest
 
     strategy:
@@ -541,7 +527,7 @@ jobs:
         build: [Release]
 
     steps:
-      - name: Clone
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Configure
@@ -549,11 +535,34 @@ jobs:
           cp models/for-tests-ggml-base.en.bin models/ggml-base.en.bin
           mkdir models/ggml-base.en-encoder.mlmodelc
 
-      - name: Build objc example
-        run: xcodebuild -project examples/whisper.objc/whisper.objc.xcodeproj -scheme whisper.objc -configuration ${{ matrix.build }} -sdk iphonesimulator build
+      - name: Build
+        id: cmake_build
+        run: |
+          sysctl -a
+          mkdir build
+          cd build
+          cmake -G Xcode .. \
+            -DGGML_METAL_USE_BF16=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DWHISPER_BUILD_EXAMPLES=OFF \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_SERVER=OFF \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM=ggml
+          cmake --build . --config Release -j $(sysctl -n hw.logicalcpu) -- CODE_SIGNING_ALLOWED=NO
+          sudo cmake --install . --config Release
+
+      - name: xcodebuild for swift package
+        id: xcodebuild
+        run: |
+          xcodebuild -scheme whisper-Package -destination 'generic/platform=iOS'
+
+#- name: Build objc example
+#  run: xcodebuild -project examples/whisper.objc/whisper.objc.xcodeproj -scheme whisper.objc -configuration ${{ matrix.build }} -sdk iphoneos build
 
       - name: Build swiftui example
-        run: xcodebuild -project examples/whisper.swiftui/whisper.swiftui.xcodeproj -scheme WhisperCppDemo -configuration ${{ matrix.build }} -sdk iphonesimulator build
+        run: xcodebuild -project examples/whisper.swiftui/whisper.swiftui.xcodeproj -scheme WhisperCppDemo -configuration ${{ matrix.build }} -sdk iphoneos CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= -destination 'generic/platform=iOS' build
 
   android:
     runs-on: ubuntu-latest
@@ -664,5 +673,6 @@ jobs:
       - name: Test quantize
         run: |
           ./models/download-ggml-model.sh tiny.en
-          make quantize
-          ./quantize models/ggml-tiny.en.bin models/ggml-tiny.en-q4_0.bin q4_0
+          cmake -B build
+          cmake --build build --config Release
+          ./build/bin/quantize models/ggml-tiny.en.bin models/ggml-tiny.en-q4_0.bin q4_0

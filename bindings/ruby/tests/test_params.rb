@@ -89,11 +89,11 @@ class TestParams < TestBase
     assert !@params.suppress_blank
   end
 
-  def test_suppress_non_speech_tokens
-    @params.suppress_non_speech_tokens = true
-    assert @params.suppress_non_speech_tokens
-    @params.suppress_non_speech_tokens = false
-    assert !@params.suppress_non_speech_tokens
+  def test_suppress_nst
+    @params.suppress_nst = true
+    assert @params.suppress_nst
+    @params.suppress_nst = false
+    assert !@params.suppress_nst
   end
 
   def test_token_timestamps
@@ -150,5 +150,11 @@ class TestParams < TestBase
     assert_in_delta -1.0, @params.logprob_thold
     @params.logprob_thold = -0.5
     assert_in_delta -0.5, @params.logprob_thold
+  end
+
+  def test_no_speech_thold
+    assert_in_delta 0.6, @params.no_speech_thold
+    @params.no_speech_thold = 0.2
+    assert_in_delta 0.2, @params.no_speech_thold
   end
 end

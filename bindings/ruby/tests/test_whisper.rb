@@ -1,5 +1,6 @@
 require_relative "helper"
 require "stringio"
+require "etc"
 
 # Exists to detect memory-related bug
 Whisper.log_set ->(level, buffer, user_data) {}, nil
@@ -10,7 +11,7 @@ class TestWhisper < TestBase
   end
 
   def test_whisper
-    @whisper = Whisper::Context.new(MODEL)
+    @whisper = Whisper::Context.new("base.en")
     params  = Whisper::Params.new
     params.print_timestamps = false
 
@@ -20,21 +21,6 @@ class TestWhisper < TestBase
   end
 
   sub_test_case "After transcription" do
-    class << self
-      attr_reader :whisper
-
-      def startup
-        @whisper = Whisper::Context.new(TestBase::MODEL)
-        params = Whisper::Params.new
-        params.print_timestamps = false
-        @whisper.transcribe(TestBase::AUDIO, params)
-      end
-    end
-
-    def whisper
-      self.class.whisper
-    end
-
     def test_full_n_segments
       assert_equal 1, whisper.full_n_segments
     end
@@ -68,6 +54,12 @@ class TestWhisper < TestBase
 
     def test_full_get_segment_text
       assert_match /ask not what your country can do for you, ask what you can do for your country/, whisper.full_get_segment_text(0)
+    end
+
+    def test_full_get_segment_no_speech_prob
+      prob = whisper.full_get_segment_no_speech_prob(0)
+      assert prob > 0.0
+      assert prob < 1.0
     end
   end
 
@@ -103,7 +95,7 @@ class TestWhisper < TestBase
       logs << [level, buffer, udata]
     }
     Whisper.log_set log_callback, user_data
-    Whisper::Context.new(MODEL)
+    Whisper::Context.new("base.en")
 
     assert logs.length > 30
     logs.each do |log|
@@ -119,9 +111,107 @@ class TestWhisper < TestBase
     }, nil
     dev = StringIO.new("")
     $stderr = dev
-    Whisper::Context.new(MODEL)
+    Whisper::Context.new("base.en")
     assert_empty dev.string
   ensure
     $stderr = stderr
+  end
+
+  sub_test_case "full" do
+    def setup
+      super
+      @whisper = Whisper::Context.new("base.en")
+      @samples = File.read(AUDIO, nil, 78).unpack("s<*").collect {|i| i.to_f / 2**15}
+    end
+
+    def test_full
+      @whisper.full(@params, @samples, @samples.length)
+
+      assert_equal 1, @whisper.full_n_segments
+      assert_match /ask not what your country can do for you, ask what you can do for your country/, @whisper.each_segment.first.text
+    end
+
+    def test_full_without_length
+      @whisper.full(@params, @samples)
+
+      assert_equal 1, @whisper.full_n_segments
+      assert_match /ask not what your country can do for you, ask what you can do for your country/, @whisper.each_segment.first.text
+    end
+
+    def test_full_enumerator
+      samples = @samples.each
+      @whisper.full(@params, samples, @samples.length)
+
+      assert_equal 1, @whisper.full_n_segments
+      assert_match /ask not what your country can do for you, ask what you can do for your country/, @whisper.each_segment.first.text
+    end
+
+    def test_full_enumerator_without_length
+      samples = @samples.each
+      assert_raise ArgumentError do
+        @whisper.full(@params, samples)
+      end
+    end
+
+    def test_full_enumerator_with_too_large_length
+      samples = @samples.each.take(10).to_enum
+      assert_raise StopIteration do
+        @whisper.full(@params, samples, 11)
+      end
+    end
+
+    def test_full_with_memory_view
+      samples = JFKReader.new(AUDIO)
+      @whisper.full(@params, samples)
+
+      assert_equal 1, @whisper.full_n_segments
+      assert_match /ask not what your country can do for you, ask what you can do for your country/, @whisper.each_segment.first.text
+    end
+
+    def test_full_parallel
+      @whisper.full_parallel(@params, @samples, @samples.length, Etc.nprocessors)
+
+      assert_equal Etc.nprocessors, @whisper.full_n_segments
+      text = @whisper.each_segment.collect(&:text).join
+      assert_match /ask what you can do/i, text
+      assert_match /for your country/i, text
+    end
+
+    def test_full_parallel_with_memory_view
+      samples = JFKReader.new(AUDIO)
+      @whisper.full_parallel(@params, samples, nil, Etc.nprocessors)
+
+      assert_equal Etc.nprocessors, @whisper.full_n_segments
+      text = @whisper.each_segment.collect(&:text).join
+      assert_match /ask what you can do/i, text
+      assert_match /for your country/i, text
+    end
+
+    def test_full_parallel_without_length_and_n_processors
+      @whisper.full_parallel(@params, @samples)
+
+      assert_equal 1, @whisper.full_n_segments
+      text = @whisper.each_segment.collect(&:text).join
+      assert_match /ask what you can do/i, text
+      assert_match /for your country/i, text
+    end
+
+    def test_full_parallel_without_length
+      @whisper.full_parallel(@params, @samples, nil, Etc.nprocessors)
+
+      assert_equal Etc.nprocessors, @whisper.full_n_segments
+      text = @whisper.each_segment.collect(&:text).join
+      assert_match /ask what you can do/i, text
+      assert_match /for your country/i, text
+    end
+
+    def test_full_parallel_without_n_processors
+      @whisper.full_parallel(@params, @samples, @samples.length)
+
+      assert_equal 1, @whisper.full_n_segments
+      text = @whisper.each_segment.collect(&:text).join
+      assert_match /ask what you can do/i, text
+      assert_match /for your country/i, text
+    end
   end
 end
